@@ -11,9 +11,11 @@ Sistem monitoring tinggi muka air (TMA) dan status pompa sebagai data dukung Flo
 - Tampilan LCD pada Box Panel (Update base JSN-SR04T)
 - Lampu Indikator Status Pompa (Continue Update Until MPU6050 Stop)
 - Konversi Perhitungan (Dasar Sungai - Pembacaan = TMA)
-- Klasifikasi Tingkat Bahaya TMA 
+- Klasifikasi Tingkat Bahaya TMA
+- Koreksi Niali TMA 
 - Connect Wifi 
 - Publish to MQTT
+- Telegram Group
 
 
 
