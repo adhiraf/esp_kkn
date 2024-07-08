@@ -1,16 +1,39 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <LiquidCrystal_I2C.h>
-#include <WiFi.h>
 #include <PubSubClient.h>
 #include <Wire.h>
-#include <ArduinoJson.h>
+#define MQTT_MAX_PACKET_SIZE 512
+
+// Replace with your network credentials
+const char* ssid = "Kecamatan 02";
+const char* password = "sabarsabar1"; // replace with your actual password
+
+// Telegram BOT Token and Chat ID
+#define BOTtoken "7279363754:AAEHcLfiYkuF5MmRPTubiNm_5rTXZOAEc-c" // Replace with your BOT token
+#define CHAT_ID "-4201858654"   // Replace with your chat ID
+
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOTtoken, client);
+
+// Initialize MQTT
+const char* mqtt_server = "broker.emqx.io";
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// Telegram bot request delay
+int botRequestDelay = 1000;
+unsigned long lastTimeBotRan;
 
 // Pins for ultrasonic sensor
 const int trigPin = 25;
 const int echoPin = 26;
 
-// LED pin (previously relay pin)
+// LED pin
 const int ledPin = 5;
 
 // Create MPU6050 instance
@@ -19,23 +42,16 @@ Adafruit_MPU6050 mpu;
 // Create LCD instance with I2C address 0x27 and 20x4 display
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
-// WiFi credentials
-const char* ssid = "MeteoJuanda";
-const char* password = "hiluxpertek"; // replace with your actual password
-
-// MQTT broker details
-const char* mqtt_server = "broker.emqx.io";
-WiFiClient espClient;
-PubSubClient client(espClient);
-
 // Constants
-const int riverbedHeight = 200; // Example riverbed height in cm
+const int riverbedHeight = 250; // Example riverbed height in cm
 
 // Timer variables
 unsigned long motionDetectedTime = 0;
 bool ledActive = false;
 unsigned long lastPublishTime = 0; // Last time MQTT message was published
 const unsigned long publishInterval = 5000; // 5 seconds
+unsigned long lastTelegramTime = 0; // Last time Telegram message was sent
+const unsigned long telegramInterval = 60000; // 1 minutes
 
 // Variables to hold TMA and hazard level
 int lastTMA = 0;
@@ -49,6 +65,9 @@ int readIndex = 0;
 long total = 0;
 long average = 0;
 
+// Monitoring state
+bool monitoringActive = false;  // Variable to track monitoring state
+
 // Function prototypes
 void setup_wifi();
 bool reconnect();
@@ -57,8 +76,34 @@ long getUltrasonicReading();
 long correctReading(long distance);
 void initSensorReadings();
 void updateLCD(int TMA, int hazardLevel);
+void handleNewMessages(int numNewMessages);
+void sendTelegramData();
 
-void setup(void) {
+// Handle new Telegram messages
+void handleNewMessages(int numNewMessages) {
+  Serial.println("handleNewMessages");
+  Serial.println(String(numNewMessages));
+
+  for (int i = 0; i < numNewMessages; i++) {
+    String chat_id = String(bot.messages[i].chat_id);
+    if (chat_id != CHAT_ID) {
+      bot.sendMessage(chat_id, "Unauthorized user", "");
+      continue;
+    }
+
+    String text = bot.messages[i].text;
+    Serial.println(text);
+
+    if (text == "/status") {
+      sendTelegramData();
+    } else if (text == "/monitor") {
+      monitoringActive = !monitoringActive;
+      bot.sendMessage(CHAT_ID, monitoringActive ? "Monitoring aktif" : "Monitoring non-aktif", "");
+    }
+  }
+}
+
+void setup() {
   Serial.begin(115200);
 
   // Initialize MPU6050
@@ -70,17 +115,16 @@ void setup(void) {
   }
   Serial.println("MPU6050 Found!");
 
-  // Setup motion detection
   mpu.setHighPassFilter(MPU6050_HIGHPASS_0_63_HZ);
   mpu.setMotionDetectionThreshold(1);
   mpu.setMotionDetectionDuration(20);
-  mpu.setInterruptPinLatch(true);  // Keep it latched.  Will turn off when reinitialized.
+  mpu.setInterruptPinLatch(true);
   mpu.setInterruptPinPolarity(true);
   mpu.setMotionInterrupt(true);
 
   // Initialize LCD
-  lcd.init();        // Correct method to initialize the LCD
-  lcd.backlight();   // Turn on the backlight
+  lcd.init();
+  lcd.backlight();
 
   // Setup pins
   pinMode(trigPin, OUTPUT);
@@ -94,9 +138,12 @@ void setup(void) {
   setup_wifi();
 
   // Setup MQTT
-  client.setServer(mqtt_server, 1883);
+  mqttClient.setServer(mqtt_server, 1883);
 
-  delay(100);
+  // Setup Telegram
+  client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+
+  bot.sendMessage(CHAT_ID, "Bot Started", "");
 }
 
 void loop() {
@@ -104,19 +151,16 @@ void loop() {
 
   // Handle motion detection and LED activation
   if (mpu.getMotionInterruptStatus()) {
-    // Motion detected
-    motionDetectedTime = currentTime; // Update the last motion detected time
+    motionDetectedTime = currentTime;
     ledActive = true;
 
-    // Get new sensor events with the readings
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
 
-    // Print out the values
     Serial.println("Detect Motion!");
   }
 
-  if (ledActive && (currentTime - motionDetectedTime < 5000)) { // 5 seconds
+  if (ledActive && (currentTime - motionDetectedTime < 5000)) {
     digitalWrite(ledPin, HIGH);
   } else {
     ledActive = false;
@@ -124,53 +168,64 @@ void loop() {
   }
 
   int pumpStatus = ledActive ? 1 : 0;
+  lastPumpStatus = pumpStatus;
 
   // Measure distance using ultrasonic sensor with moving average
   long averageDistance = getUltrasonicReading();
 
-  // Calculate TMA
   int TMA = riverbedHeight - averageDistance;
-  lastTMA = TMA; // Store the last TMA for MQTT publishing
+  lastTMA = TMA;
 
-  // Print debug information for average distance and TMA
   Serial.print("Average distance: ");
   Serial.print(averageDistance);
   Serial.print(" cm, TMA: ");
   Serial.print(TMA);
   Serial.println(" cm");
 
-  // Determine hazard level
   int hazardLevel;
   String hazardLevelStr;
   if (TMA >= 150) {
-    hazardLevel = 4; // BAHAYA
+    hazardLevel = 3;
     hazardLevelStr = "BAHAYA";
-  } else if (TMA >= 120) {
-    hazardLevel = 3; // SIAGA
-    hazardLevelStr = "SIAGA";
   } else if (TMA >= 100) {
-    hazardLevel = 2; // WASPADA
+    hazardLevel = 2;
     hazardLevelStr = "WASPADA";
   } else {
-    hazardLevel = 1; // NORMAL
-    hazardLevelStr = "NORMAL";
+    hazardLevel = 1;
+    hazardLevelStr = "AMAN";
   }
-  lastHazardLevel = hazardLevel; // Store the last hazard level for MQTT publishing
+  lastHazardLevel = hazardLevel;
 
-  // Update LCD
   updateLCD(lastTMA, lastHazardLevel);
 
-  // Handle MQTT connection and publishing
   if (currentTime - lastPublishTime >= publishInterval) {
     sendMQTTData(lastTMA, pumpStatus, lastHazardLevel);
     lastPublishTime = currentTime;
   }
-  if (!client.connected()) {
+
+  if (!mqttClient.connected()) {
     reconnect();
   }
-  client.loop();
+  mqttClient.loop();
 
-  delay(1000); // Delay for 1 second
+  // Check if monitoring is active and handle continuous sending to Telegram
+  if (monitoringActive && (lastHazardLevel == 2 || lastHazardLevel == 3) && (currentTime - lastTelegramTime >= telegramInterval)) {
+    sendTelegramData();
+    lastTelegramTime = currentTime;
+  }
+
+  if (millis() > lastTimeBotRan + botRequestDelay) {
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+
+    while (numNewMessages) {
+      Serial.println("got response");
+      handleNewMessages(numNewMessages);
+      numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    }
+    lastTimeBotRan = millis();
+  }
+
+  delay(1000);
 }
 
 void setup_wifi() {
@@ -194,38 +249,40 @@ void setup_wifi() {
 
 bool reconnect() {
   Serial.print("Attempting MQTT connection...");
+  // Create a unique client ID
+  String clientId = "ESP32Client_" + String(random(0xffff), HEX);
   // Attempt to connect
-  if (client.connect("ESP32Client")) {
+  if (mqttClient.connect(clientId.c_str())) {
     Serial.println("connected");
-    // Once connected, publish an announcement
-    client.publish("KKNSTMKG15/status", "Connected");
+    // Once connected, publish an announcement...
+    mqttClient.publish("KKNSTMKG15/status", "Connected");
+    // ... and resubscribe
+    // mqttClient.subscribe("inTopic"); // Uncomment if you have subscriptions
     return true;
   } else {
     Serial.print("failed, rc=");
-    Serial.print(client.state());
+    Serial.print(mqttClient.state());
     Serial.println(" try again in 3 seconds");
+    delay(3000);
     return false;
   }
 }
 
 void sendMQTTData(int tma, int pumpStatus, int hazardLevel) {
-  // Create JSON object with StaticJsonDocument from ArduinoJson library
-  StaticJsonDocument<100> doc; // Adjust the size as needed
+  StaticJsonDocument<100> doc;
 
-  // Fill data into the JSON document
   doc["TMA"] = tma;
   doc["PumpStatus"] = pumpStatus;
   doc["HazardLevel"] = hazardLevel;
 
-  // Serialize JSON into a string
-  char jsonBuffer[100]; // Adjust the buffer size as needed
+  char jsonBuffer[100];
   serializeJson(doc, jsonBuffer);
 
-  // Send message to the MQTT broker
   Serial.println("Publishing data!");
-  client.publish("KKNSTMKG15/parameter", jsonBuffer);
-  if (!client.publish("KKNSTMKG15/parameter", jsonBuffer)) {
+  if (!mqttClient.publish("KKNSTMKG15/parameter", jsonBuffer)) {
     Serial.println("Failed to publish message");
+  } else {
+    Serial.println("Publish Completed");
   }
 }
 
@@ -239,39 +296,36 @@ long getUltrasonicReading() {
     delayMicroseconds(10);
     digitalWrite(trigPin, LOW);
     duration = pulseIn(echoPin, HIGH);
-    distance = duration * 0.034 / 2; // One-way distance
+    distance = duration * 0.034 / 2;
 
     sum += distance;
 
-    delay(50); // Small delay between readings
+    delay(50);
   }
 
-  // Calculate the average distance
   long averageDistance = sum / numReadings;
-
-  // Apply correction formula
   long correctedDistance = correctReading(averageDistance);
-
-  // Print debug information for average ultrasonic sensor reading
-  Serial.print("Corrected average distance: ");
-  Serial.print(correctedDistance);
-  Serial.println(" cm");
 
   return correctedDistance;
 }
 
 long correctReading(long distance) {
-  double x = distance;
-  double y = 0.0007 * x * x + 0.0748 * x - 3.1813;
-  return distance + y;
+  long correctedDistance = distance;
+
+  if (distance >= 70 && distance <= 80) {
+    correctedDistance -= 15;
+  } else if (distance > 80 && distance <= 90) {
+    correctedDistance -= 10;
+  } else if (distance > 90 && distance <= 100) {
+    correctedDistance -= 5;
+  }
+  return correctedDistance;
 }
 
 void initSensorReadings() {
-  // Initialize readings array with initial distance measurements
   for (int i = 0; i < numReadings; i++) {
     readings[i] = getUltrasonicReading();
     total += readings[i];
-    delay(50); // Small delay between readings
   }
   average = total / numReadings;
 }
@@ -292,11 +346,8 @@ void updateLCD(int TMA, int hazardLevel) {
   // Row 3: Hazard level centered
   String hazardLevelStr;
   switch (hazardLevel) {
-    case 4:
-      hazardLevelStr = "BAHAYA";
-      break;
     case 3:
-      hazardLevelStr = "SIAGA";
+      hazardLevelStr = "BAHAYA";
       break;
     case 2:
       hazardLevelStr = "WASPADA";
@@ -312,4 +363,20 @@ void updateLCD(int TMA, int hazardLevel) {
   // Row 4: "KKN STMKG Unit 15" centered
   lcd.setCursor((20 - strlen("KKN STMKG Unit 15")) / 2, 3);
   lcd.print("KKN STMKG Unit 15");
+}
+
+void sendTelegramData() {
+  String message = "Tinggi Muka Air: " + String(lastTMA) + " cm\n";
+  message += "Status Pompa: " + String(lastPumpStatus == 1 ? "ON" : "OFF") + "\n";
+  message += "Peringatan Banjir: ";
+
+  if (lastHazardLevel == 3) {
+    message += "BAHAYA";
+  } else if (lastHazardLevel == 2) {
+    message += "WASPADA";
+  } else {
+    message += "AMAN";
+  }
+
+  bot.sendMessage(CHAT_ID, message, "");
 }
