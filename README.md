@@ -21,9 +21,3 @@ Sistem monitoring tinggi muka air (TMA) dan status pompa sebagai data dukung Flo
 
 ## Update Posibility
 - Lampu Indikator Bahaya TMA 
-
-
-
-## Authors
-
-- [@adhiraf]([https://github.com/adhiraf])
